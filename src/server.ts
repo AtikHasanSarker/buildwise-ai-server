@@ -11,6 +11,7 @@ import productRoutes from "./routes/product.routes";
 import reviewRoutes from "./routes/review.routes";
 import favoriteRoutes from "./routes/favorite.routes";
 import buildRoutes from "./routes/build.routes";
+import aiRoutes from "./routes/ai.routes";
 import { errorHandler } from "./middleware/errorHandler";
 
 const app = express();
@@ -33,6 +34,7 @@ app.use("/api/v1/products", productRoutes);
 app.use("/api/v1", reviewRoutes);
 app.use("/api/v1/favorites", favoriteRoutes);
 app.use("/api/v1/builds", buildRoutes);
+app.use("/api/v1/ai", aiRoutes);
 
 // Error handling
 app.use(errorHandler);
