@@ -7,6 +7,8 @@ import cookieParser from "cookie-parser";
 import connectDB from "./config/db";
 import healthRoutes from "./routes/health";
 import authRoutes from "./routes/auth.routes";
+import productRoutes from "./routes/product.routes";
+import reviewRoutes from "./routes/review.routes";
 import { errorHandler } from "./middleware/errorHandler";
 
 const app = express();
@@ -25,6 +27,8 @@ app.use(cookieParser());
 // Routes
 app.use("/api/v1/health", healthRoutes);
 app.use("/api/v1/auth", authRoutes);
+app.use("/api/v1/products", productRoutes);
+app.use("/api/v1", reviewRoutes);
 
 // Error handling
 app.use(errorHandler);
