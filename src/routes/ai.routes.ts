@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import Product, { ProductCategory } from "../models/Product";
+import Product, { ProductCategory, IProduct } from "../models/Product";
 import AIConversation from "../models/AIConversation";
 import RateLimit from "../models/RateLimit";
 import { sendSuccess, sendError } from "../utils/response";
@@ -329,6 +329,454 @@ router.post("/generate-build", async (req: Request, res: Response) => {
       return sendError(res, "AI service temporarily unavailable", 502, "AI_ERROR", message);
     }
     sendError(res, "Failed to generate build", 500, "SERVER_ERROR", message);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/ai/check-compatibility
+// ---------------------------------------------------------------------------
+
+interface ComponentInput {
+  productId: string;
+  category: string;
+}
+
+interface CompatibilityIssue {
+  componentA: { productId: string; name: string };
+  componentB: { productId: string; name: string };
+  issue: string;
+  suggestion: string;
+  alternativeProducts: unknown[];
+}
+
+// Lean product type (matches .lean() output)
+type LeanProduct = {
+  _id: { toString(): string };
+  name: string;
+  brand: string;
+  category: string;
+  price: number;
+  description: string;
+  images: string[];
+  specifications: Record<string, unknown>;
+  rating: number;
+  reviewCount: number;
+  stock: number;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+// Extract DDR generation from RAM speed string (e.g. "DDR5-6000" → "DDR5")
+const extractRamGeneration = (speed?: string): string | null => {
+  if (!speed) return null;
+  const match = speed.toUpperCase().match(/DDR\d/);
+  return match ? match[0] : null;
+};
+
+// Estimate power draw from a component's specs
+const estimateWattageDraw = (product: LeanProduct): number => {
+  const specs = product.specifications;
+  if (typeof specs.tdp === "number") return specs.tdp;
+  if (typeof specs.wattageDraw === "number") return specs.wattageDraw;
+  const estimates: Record<string, number> = {
+    CPU: 125, GPU: 200, Motherboard: 50, RAM: 10, SSD: 10,
+    HDD: 10, PSU: 0, Case: 5, Cooler: 10,
+  };
+  return estimates[product.category] ?? 30;
+};
+
+const runRuleBasedChecks = (
+  products: LeanProduct[]
+): { pair: [string, string]; issue: string }[] => {
+  const issues: { pair: [string, string]; issue: string }[] = [];
+  const byCategory = new Map<string, LeanProduct>();
+  for (const p of products) byCategory.set(p.category, p);
+
+  // 1. CPU ↔ Motherboard socket
+  const cpu = byCategory.get("CPU");
+  const mobo = byCategory.get("Motherboard");
+  if (cpu && mobo) {
+    const cpuSocket = (cpu.specifications as Record<string, unknown>).socket as string | undefined;
+    const moboSocket = (mobo.specifications as Record<string, unknown>).socket as string | undefined;
+    if (cpuSocket && moboSocket) {
+      if (cpuSocket !== moboSocket) {
+        issues.push({
+          pair: [cpu._id.toString(), mobo._id.toString()],
+          issue: `CPU socket ${cpuSocket} is not compatible with motherboard socket ${moboSocket}`,
+        });
+      }
+    }
+  }
+
+  // 2. RAM ↔ Motherboard DDR generation
+  const ram = byCategory.get("RAM");
+  if (ram && mobo) {
+    const ramSpeed = (ram.specifications as Record<string, unknown>).speed as string | undefined;
+    const ramGen = extractRamGeneration(ramSpeed);
+    // Determine motherboard DDR support from chipset or infer from socket
+    const moboSpecs = mobo.specifications as Record<string, unknown>;
+    const moboSocket = moboSpecs.socket as string | undefined;
+    // AM5 = DDR5, LGA1700 supports both but Z790 = DDR5, B660/B760 = DDR4 or DDR5
+    let moboRamGen: string | null = null;
+    if (moboSocket === "AM5") moboRamGen = "DDR5";
+    else if (moboSocket === "LGA1700") {
+      const chipset = (moboSpecs.chipset as string) || "";
+      moboRamGen = chipset.startsWith("Z") ? "DDR5" : null; // Z-series = DDR5, others ambiguous
+    }
+
+    if (ramGen && moboRamGen && ramGen !== moboRamGen) {
+      issues.push({
+        pair: [ram._id.toString(), mobo._id.toString()],
+        issue: `RAM type ${ramGen} is not compatible with motherboard which requires ${moboRamGen}`,
+      });
+    }
+  }
+
+  // 3. PSU wattage vs CPU+GPU draw (20% headroom)
+  const psu = byCategory.get("PSU");
+  if (psu) {
+    const psuWattage = (psu.specifications as Record<string, unknown>).wattage as number | undefined;
+    if (psuWattage) {
+      let totalDraw = 0;
+      for (const p of products) {
+        if (p.category === "CPU" || p.category === "GPU") {
+          totalDraw += estimateWattageDraw(p);
+        }
+      }
+      const required = totalDraw * 1.2;
+      if (psuWattage < required) {
+        const conflictingIds: string[] = [];
+        if (cpu) conflictingIds.push(cpu._id.toString());
+        if (byCategory.get("GPU")) conflictingIds.push(byCategory.get("GPU")!._id.toString());
+        issues.push({
+          pair: [psu._id.toString(), ...conflictingIds] as [string, string],
+          issue: `PSU ${psuWattage}W provides insufficient power — system requires at least ${Math.round(required)}W (${Math.round(totalDraw)}W draw + 20% headroom)`,
+        });
+      }
+    }
+  }
+
+  // 4. SSD interface vs Motherboard M.2 slots
+  const ssd = byCategory.get("SSD") || byCategory.get("HDD");
+  if (ssd && mobo) {
+    const ssdSpecs = ssd.specifications as Record<string, unknown>;
+    const ssdInterface = ssdSpecs.interface as string | undefined;
+    const ssdFormFactor = ssdSpecs.formFactor as string | undefined;
+    const moboSpecs2 = mobo.specifications as Record<string, unknown>;
+    const m2Slots = moboSpecs2.m2Slots as number | undefined;
+
+    // If it's an M.2 NVMe SSD but mobo has no M.2 slots
+    if (ssdFormFactor?.includes("M.2") && ssdInterface?.includes("NVMe")) {
+      if (typeof m2Slots === "number" && m2Slots === 0) {
+        issues.push({
+          pair: [ssd._id.toString(), mobo._id.toString()],
+          issue: `NVMe SSD requires an M.2 slot but the motherboard has none`,
+        });
+      }
+    }
+  }
+
+  // 5. GPU length vs Case clearance
+  const gpu = byCategory.get("GPU");
+  const case_ = byCategory.get("Case");
+  if (gpu && case_) {
+    const gpuLength = (gpu.specifications as Record<string, unknown>).length as string | undefined;
+    const caseSpecs = case_.specifications as Record<string, unknown>;
+    const maxGpuLength = caseSpecs.maxGpuLength as string | undefined;
+    if (gpuLength && maxGpuLength) {
+      const gpuMm = parseFloat(gpuLength);
+      const caseMm = parseFloat(maxGpuLength);
+      if (!isNaN(gpuMm) && !isNaN(caseMm) && gpuMm > caseMm) {
+        issues.push({
+          pair: [gpu._id.toString(), case_._id.toString()],
+          issue: `GPU length ${gpuLength} exceeds case maximum GPU clearance of ${maxGpuLength}`,
+        });
+      }
+    }
+  }
+
+  // 6. Cooler height vs Case clearance
+  const cooler = byCategory.get("Cooler");
+  if (cooler && case_) {
+    const coolerHeight = (cooler.specifications as Record<string, unknown>).height as string | undefined;
+    const caseSpecs3 = case_.specifications as Record<string, unknown>;
+    const maxCoolerHeight = caseSpecs3.maxCoolerHeight as string | undefined;
+    if (coolerHeight && maxCoolerHeight) {
+      const coolerMm = parseFloat(coolerHeight);
+      const caseMm = parseFloat(maxCoolerHeight);
+      if (!isNaN(coolerMm) && !isNaN(caseMm) && coolerMm > caseMm) {
+        issues.push({
+          pair: [cooler._id.toString(), case_._id.toString()],
+          issue: `CPU cooler height ${coolerHeight} exceeds case maximum cooler height of ${maxCoolerHeight}`,
+        });
+      }
+    }
+  }
+
+  return issues;
+};
+
+const generateExplanation = async (
+  genAI: GoogleGenerativeAI,
+  productA: LeanProduct,
+  productB: LeanProduct,
+  issueText: string
+): Promise<string> => {
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const prompt = `You are a PC hardware expert. Explain this compatibility issue in 1-2 clear sentences.
+Return ONLY valid JSON: { "issue": "your explanation" }
+
+Product A: ${productA.name} (${productA.category})
+Product B: ${productB.name} (${productB.category})
+Problem: ${issueText}`;
+
+    const result = await model.generateContent(prompt);
+    let text = result.response.text().trim();
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    const parsed = JSON.parse(text);
+    return parsed.issue || issueText;
+  } catch {
+    return issueText;
+  }
+};
+
+const findAlternatives = async (
+  incompatibleProduct: LeanProduct,
+  _otherProducts: LeanProduct[],
+  requiredSpec: { key: string; value: unknown }
+): Promise<unknown[]> => {
+  const query: Record<string, unknown> = {
+    category: incompatibleProduct.category,
+    stock: { $gt: 0 },
+    _id: { $ne: incompatibleProduct._id },
+  };
+
+  // Find products where the required spec matches
+  const candidates = await Product.find(query)
+    .select("name brand price category specifications images rating stock")
+    .lean();
+
+  return candidates
+    .filter((c) => {
+      const specs = c.specifications as Record<string, unknown>;
+      return specs[requiredSpec.key] === requiredSpec.value;
+    })
+    .slice(0, 3);
+};
+
+// POST /api/v1/ai/check-compatibility
+router.post("/check-compatibility", async (req: Request, res: Response) => {
+  try {
+    const { components } = req.body as { components?: ComponentInput[] };
+
+    // Step 1: Validate input
+    if (!components || !Array.isArray(components) || components.length < 2) {
+      return sendError(
+        res,
+        "At least 2 components are required",
+        400,
+        "VALIDATION_ERROR",
+        "components: must be an array with at least 2 items"
+      );
+    }
+
+    const productIds = components.map((c) => c.productId);
+    const existingProducts = await Product.find({ _id: { $in: productIds } }).lean();
+
+    if (existingProducts.length !== productIds.length) {
+      const foundIds = new Set(existingProducts.map((p) => p._id.toString()));
+      const missing = productIds.filter((id) => !foundIds.has(id));
+      return sendError(
+        res,
+        "Some products were not found",
+        400,
+        "VALIDATION_ERROR",
+        `Products not found: ${missing.join(", ")}`
+      );
+    }
+
+    // Step 2: Build product map
+    const productMap = new Map(existingProducts.map((p) => [p._id.toString(), p]));
+    const orderedProducts = productIds.map((id) => productMap.get(id)!).filter(Boolean);
+
+    // Step 3: Rule-based compatibility checks
+    const rawIssues = runRuleBasedChecks(orderedProducts);
+
+    if (rawIssues.length === 0) {
+      return sendSuccess(res, {
+        compatible: true,
+        issues: [],
+      }, "All components are compatible");
+    }
+
+    // Step 4 & 5: For each issue, get AI explanation + find alternatives
+    const apiKey = process.env.GEMINI_API_KEY;
+    const genAI = apiKey ? new GoogleGenerativeAI(apiKey) : null;
+
+    const issues: CompatibilityIssue[] = [];
+
+    for (const raw of rawIssues) {
+      const idA = raw.pair[0];
+      const idB = raw.pair[1];
+      const prodA = productMap.get(idA)!;
+      const prodB = productMap.get(idB)!;
+
+      // AI explanation (graceful fallback)
+      let explanation = raw.issue;
+      if (genAI) {
+        explanation = await generateExplanation(genAI, prodA, prodB, raw.issue);
+      }
+
+      // Find alternatives for the incompatible product (first in the pair)
+      let alternativeProducts: unknown[] = [];
+      const incompatible = prodA;
+      const otherProduct = prodB;
+
+      // Determine what spec we need for the alternative
+      const incompatibleSpecs = incompatible.specifications as Record<string, unknown>;
+      const otherSpecs = otherProduct.specifications as Record<string, unknown>;
+
+      if (incompatible.category === "CPU") {
+        // Need CPU with same socket as motherboard
+        if (otherSpecs.socket) {
+          alternativeProducts = await findAlternatives(incompatible, orderedProducts, {
+            key: "socket",
+            value: otherSpecs.socket,
+          });
+        }
+      } else if (incompatible.category === "Motherboard") {
+        // Need motherboard with same socket as CPU
+        if (otherSpecs.socket) {
+          alternativeProducts = await findAlternatives(incompatible, orderedProducts, {
+            key: "socket",
+            value: otherSpecs.socket,
+          });
+        }
+      } else if (incompatible.category === "RAM") {
+        // Need RAM with matching DDR generation
+        const moboSpecs = otherSpecs;
+        const moboSocket = moboSpecs.socket as string | undefined;
+        let requiredGen: string | null = null;
+        if (moboSocket === "AM5") requiredGen = "DDR5";
+        else if (moboSocket === "LGA1700") {
+          const chipset = (moboSpecs.chipset as string) || "";
+          requiredGen = chipset.startsWith("Z") ? "DDR5" : null;
+        }
+        if (requiredGen) {
+          const allRam = await Product.find({
+            category: "RAM",
+            stock: { $gt: 0 },
+            _id: { $ne: incompatible._id },
+          }).lean();
+          alternativeProducts = allRam
+            .filter((r) => {
+              const gen = extractRamGeneration(
+                (r.specifications as Record<string, unknown>).speed as string
+              );
+              return gen === requiredGen;
+            })
+            .slice(0, 3);
+        }
+      } else if (incompatible.category === "PSU") {
+        // Need higher wattage PSU
+        const totalDraw = orderedProducts
+          .filter((p) => p.category === "CPU" || p.category === "GPU")
+          .reduce((sum, p) => sum + estimateWattageDraw(p), 0);
+        const requiredWattage = totalDraw * 1.2;
+        const allPsu = await Product.find({
+          category: "PSU",
+          stock: { $gt: 0 },
+          _id: { $ne: incompatible._id },
+        }).lean();
+        alternativeProducts = allPsu
+          .filter((p) => {
+            const w = (p.specifications as Record<string, unknown>).wattage as number;
+            return w >= requiredWattage;
+          })
+          .sort((a, b) => a.price - b.price)
+          .slice(0, 3);
+      } else if (incompatible.category === "SSD" || incompatible.category === "HDD") {
+        // Find compatible storage
+        if (otherSpecs.m2Slots !== undefined) {
+          const m2Slots = otherSpecs.m2Slots as number;
+          if (m2Slots > 0) {
+            // Find NVMe SSDs
+            const allSsd = await Product.find({
+              category: "SSD",
+              stock: { $gt: 0 },
+              _id: { $ne: incompatible._id },
+            }).lean();
+            alternativeProducts = allSsd.slice(0, 3);
+          } else {
+            // Find SATA drives
+            const allStorage = await Product.find({
+              category: { $in: ["SSD", "HDD"] },
+              stock: { $gt: 0 },
+              _id: { $ne: incompatible._id },
+            }).lean();
+            alternativeProducts = allStorage
+              .filter((s) => {
+                const iface = (s.specifications as Record<string, unknown>).interface as string;
+                return iface?.includes("SATA");
+              })
+              .slice(0, 3);
+          }
+        }
+      } else if (incompatible.category === "GPU") {
+        // Find shorter GPU
+        const maxLen = parseFloat(
+          (otherSpecs.maxGpuLength as string) || "999"
+        );
+        const allGpu = await Product.find({
+          category: "GPU",
+          stock: { $gt: 0 },
+          _id: { $ne: incompatible._id },
+        }).lean();
+        alternativeProducts = allGpu
+          .filter((g) => {
+            const len = parseFloat(
+              (g.specifications as Record<string, unknown>).length as string || "0"
+            );
+            return !isNaN(len) && len <= maxLen;
+          })
+          .slice(0, 3);
+      } else if (incompatible.category === "Cooler") {
+        // Find shorter cooler
+        const maxH = parseFloat(
+          (otherSpecs.maxCoolerHeight as string) || "999"
+        );
+        const allCooler = await Product.find({
+          category: "Cooler",
+          stock: { $gt: 0 },
+          _id: { $ne: incompatible._id },
+        }).lean();
+        alternativeProducts = allCooler
+          .filter((c) => {
+            const h = parseFloat(
+              (c.specifications as Record<string, unknown>).height as string || "0"
+            );
+            return !isNaN(h) && h <= maxH;
+          })
+          .slice(0, 3);
+      }
+
+      issues.push({
+        componentA: { productId: prodA._id.toString(), name: prodA.name },
+        componentB: { productId: prodB._id.toString(), name: prodB.name },
+        issue: explanation,
+        suggestion: `Consider replacing ${prodA.name} with a compatible alternative`,
+        alternativeProducts,
+      });
+    }
+
+    sendSuccess(res, {
+      compatible: false,
+      issues,
+    }, `Found ${issues.length} compatibility issue(s)`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    sendError(res, "Failed to check compatibility", 500, "SERVER_ERROR", message);
   }
 });
 
