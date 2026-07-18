@@ -1,4 +1,4 @@
-import mongoose, { Document, Schema } from "mongoose";
+import mongoose, { Document, Schema, Types } from "mongoose";
 
 export interface IUser extends Document {
   name: string;
@@ -7,6 +7,7 @@ export interface IUser extends Document {
   avatar?: string;
   role: "user" | "admin";
   googleId?: string;
+  favorites: Types.ObjectId[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -29,6 +30,7 @@ const userSchema = new Schema<IUser>(
       default: "user",
     },
     googleId: { type: String, sparse: true },
+    favorites: [{ type: Schema.Types.ObjectId, ref: "Product" }],
   },
   { timestamps: true }
 );

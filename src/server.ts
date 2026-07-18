@@ -9,6 +9,8 @@ import healthRoutes from "./routes/health";
 import authRoutes from "./routes/auth.routes";
 import productRoutes from "./routes/product.routes";
 import reviewRoutes from "./routes/review.routes";
+import favoriteRoutes from "./routes/favorite.routes";
+import buildRoutes from "./routes/build.routes";
 import { errorHandler } from "./middleware/errorHandler";
 
 const app = express();
@@ -29,6 +31,8 @@ app.use("/api/v1/health", healthRoutes);
 app.use("/api/v1/auth", authRoutes);
 app.use("/api/v1/products", productRoutes);
 app.use("/api/v1", reviewRoutes);
+app.use("/api/v1/favorites", favoriteRoutes);
+app.use("/api/v1/builds", buildRoutes);
 
 // Error handling
 app.use(errorHandler);
