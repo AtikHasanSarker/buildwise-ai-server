@@ -780,4 +780,313 @@ router.post("/check-compatibility", async (req: Request, res: Response) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Helpers for chat
+// ---------------------------------------------------------------------------
+
+const CHAT_SYSTEM_PROMPT = `You are BuildWise AI's shopping assistant — an expert in PC hardware.
+You can help users with:
+- Product recommendations based on budget and use case
+- Component comparisons and trade-offs
+- Upgrade suggestions for existing builds
+- General buying advice for PC parts
+
+Guidelines:
+- Be concise and helpful (2-4 sentences max per reply unless asked for detail).
+- Reference real products and prices when product context is provided.
+- If you don't have enough info, ask a clarifying question.
+- Never invent product IDs or prices — only reference products from the provided context.
+- Keep a friendly, knowledgeable tone.`;
+
+// Detect product-related keywords in user message
+const PRODUCT_KEYWORDS = [
+  "cpu", "gpu", "motherboard", "ram", "ssd", "hdd", "psu", "case", "cooler",
+  "processor", "graphics", "memory", "storage", "power supply", "benchmark",
+  "gaming", "editing", "programming", "budget", "build", "upgrade", "recommend",
+];
+
+const extractCategoryHints = (message: string): string[] => {
+  const lower = message.toLowerCase();
+  const hints: string[] = [];
+  const categoryMap: Record<string, string> = {
+    cpu: "CPU", processor: "CPU",
+    gpu: "GPU", graphics: "GPU", rtx: "GPU", radeon: "GPU", geforce: "GPU",
+    motherboard: "Motherboard", mobo: "Motherboard",
+    ram: "RAM", memory: "RAM", ddr4: "RAM", ddr5: "RAM",
+    ssd: "SSD", nvme: "SSD", "m.2": "SSD",
+    hdd: "HDD", "hard drive": "HDD",
+    psu: "PSU", "power supply": "PSU", watt: "PSU",
+    case: "Case", chassis: "Case",
+    cooler: "Cooler", "cpu cooler": "Cooler", "liquid cooler": "Cooler",
+  };
+  for (const [keyword, category] of Object.entries(categoryMap)) {
+    if (lower.includes(keyword) && !hints.includes(category)) {
+      hints.push(category);
+    }
+  }
+  return hints;
+};
+
+const searchRelevantProducts = async (message: string): Promise<unknown[]> => {
+  const categories = extractCategoryHints(message);
+  if (categories.length === 0) return [];
+
+  const products = await Product.find({ category: { $in: categories }, stock: { $gt: 0 } })
+    .select("name brand price category specifications rating")
+    .sort({ rating: -1 })
+    .limit(10)
+    .lean();
+
+  return products.map((p) => ({
+    id: p._id.toString(),
+    name: p.name,
+    brand: p.brand,
+    price: p.price,
+    category: p.category,
+    specs: p.specifications,
+    rating: p.rating,
+  }));
+};
+
+const buildChatPrompt = (
+  userMessage: string,
+  history: { role: string; content: string }[],
+  productContext: unknown[]
+): { role: string; parts: string }[] => {
+  const messages: { role: string; parts: string }[] = [];
+
+  // System instruction
+  messages.push({ role: "user", parts: CHAT_SYSTEM_PROMPT });
+  messages.push({ role: "model", parts: "Understood. I'm BuildWise AI's shopping assistant. How can I help you with your PC build?" });
+
+  // Conversation history
+  for (const msg of history) {
+    messages.push({
+      role: msg.role === "user" ? "user" : "model",
+      parts: msg.content,
+    });
+  }
+
+  // Current user message with product context
+  let contextBlock = "";
+  if (productContext.length > 0) {
+    contextBlock = `\n\n[Product Context — reference these real products in your reply]\n${JSON.stringify(productContext, null, 2)}`;
+  }
+
+  messages.push({ role: "user", parts: userMessage + contextBlock });
+
+  return messages;
+};
+
+const generateSuggestedPrompts = async (
+  genAI: GoogleGenerativeAI,
+  conversationTopic: string
+): Promise<string[]> => {
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const result = await model.generateContent(
+      `Based on this PC building conversation topic: "${conversationTopic}", generate exactly 3 short follow-up questions a user might ask. Return ONLY a valid JSON array of strings, no markdown.\nExample: ["question 1", "question 2", "question 3"]`
+    );
+    let text = result.response.text().trim();
+    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.slice(0, 3);
+    }
+    return [];
+  } catch {
+    return [];
+  }
+};
+
+// POST /api/v1/ai/chat — SSE streaming
+router.post("/chat", async (req: Request, res: Response) => {
+  try {
+    const { message, conversationId } = req.body;
+
+    // Step 1: Validate
+    if (!message?.trim()) {
+      return sendError(res, "Message is required", 400, "VALIDATION_ERROR", "message: required and non-empty");
+    }
+
+    // Rate limiting (shared with generate-build)
+    const isAuth = !!req.user;
+    const identifier = isAuth ? `user:${req.user!._id}` : `ip:${req.ip}`;
+    const dailyLimit = isAuth ? 50 : 5;
+    const rateCheck = await checkRateLimit(identifier, dailyLimit);
+    if (!rateCheck.allowed) {
+      return sendError(res, `Daily AI request limit reached (${dailyLimit}/day)`, 429, "RATE_LIMITED", `Used ${rateCheck.count}/${dailyLimit}`);
+    }
+
+    // Step 2: Load or create conversation
+    let conversation;
+    if (conversationId) {
+      conversation = await AIConversation.findById(conversationId);
+      if (!conversation) {
+        return sendError(res, "Conversation not found", 404, "NOT_FOUND", `No conversation with id ${conversationId}`);
+      }
+      // If authenticated, verify ownership
+      if (req.user && conversation.userId.toString() !== req.user._id.toString()) {
+        return sendError(res, "Not authorized", 403, "FORBIDDEN", "You can only chat in your own conversations");
+      }
+    } else if (req.user) {
+      conversation = await AIConversation.create({ userId: req.user._id, messages: [] });
+    }
+    // For guests without conversationId, we stream but don't persist
+
+    // Get last ~15 messages for context
+    const history = conversation
+      ? conversation.messages.slice(-15).map((m) => ({ role: m.role, content: m.content }))
+      : [];
+
+    // Step 3: Search for relevant products
+    const productContext = await searchRelevantProducts(message);
+
+    // Step 4: Set up SSE
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      res.write(`data: ${JSON.stringify({ type: "error", message: "AI service not configured" })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+    const chatMessages = buildChatPrompt(message.trim(), history, productContext);
+
+    // Step 5: Stream from Gemini
+    let fullReply = "";
+    try {
+      const result = await model.generateContent({
+        contents: chatMessages.map((m) => ({
+          role: m.role === "model" ? "model" : "user",
+          parts: [{ text: m.parts }],
+        })),
+      });
+
+      const text = result.response.text();
+      // Simulate streaming by sending chunks
+      const chunkSize = 20;
+      for (let i = 0; i < text.length; i += chunkSize) {
+        const chunk = text.substring(i, i + chunkSize);
+        fullReply += chunk;
+        res.write(`data: ${JSON.stringify({ type: "token", content: chunk })}\n\n`);
+      }
+    } catch (geminiError) {
+      const errMsg = geminiError instanceof Error ? geminiError.message : "AI service error";
+      res.write(`data: ${JSON.stringify({ type: "error", message: errMsg })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+
+    // Step 6: Save messages to conversation
+    let savedConversationId = conversationId || null;
+    if (conversation) {
+      conversation.messages.push({ role: "user", content: message.trim(), timestamp: new Date() });
+      conversation.messages.push({ role: "assistant", content: fullReply, timestamp: new Date() });
+      await conversation.save();
+      savedConversationId = conversation._id.toString();
+    }
+
+    // Step 7: Generate suggested prompts
+    let suggestedPrompts: string[] = [];
+    if (productContext.length > 0) {
+      const topicSummary = extractCategoryHints(message).join(", ") || message.substring(0, 50);
+      suggestedPrompts = await generateSuggestedPrompts(genAI, topicSummary);
+    }
+
+    // Send metadata as final event
+    res.write(`data: ${JSON.stringify({
+      type: "done",
+      conversationId: savedConversationId,
+      suggestedPrompts,
+    })}\n\n`);
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    // If headers already sent (SSE in progress), send error event
+    if (res.headersSent) {
+      res.write(`data: ${JSON.stringify({ type: "error", message })}\n\n`);
+      res.write("data: [DONE]\n\n");
+      return res.end();
+    }
+    sendError(res, "Failed to process chat", 500, "SERVER_ERROR", message);
+  }
+});
+
+// GET /api/v1/ai/conversations — list user's conversations
+router.get("/conversations", authenticate, async (req: Request, res: Response) => {
+  try {
+    const { page = "1", limit = "20" } = req.query;
+    const pageNum = Math.max(1, parseInt(page as string, 10) || 1);
+    const limitNum = Math.min(50, Math.max(1, parseInt(limit as string, 10) || 20));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [conversations, total] = await Promise.all([
+      AIConversation.find({ userId: req.user!._id })
+        .select("messages.role messages.content createdAt updatedAt")
+        .sort({ updatedAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      AIConversation.countDocuments({ userId: req.user!._id }),
+    ]);
+
+    const formatted = conversations.map((c) => {
+      const firstUserMsg = c.messages.find((m) => m.role === "user");
+      return {
+        id: c._id.toString(),
+        title: firstUserMsg ? firstUserMsg.content.substring(0, 80) : "New conversation",
+        messageCount: c.messages.length,
+        createdAt: c.createdAt,
+        updatedAt: c.updatedAt,
+      };
+    });
+
+    sendSuccess(res, { conversations: formatted, total, page: pageNum, totalPages: Math.ceil(total / limitNum) });
+  } catch (error) {
+    sendError(res, "Failed to fetch conversations", 500, "SERVER_ERROR", (error as Error).message);
+  }
+});
+
+// GET /api/v1/ai/conversations/:id — owner only
+router.get("/conversations/:id", authenticate, async (req: Request, res: Response) => {
+  try {
+    const conversation = await AIConversation.findById(req.params.id).lean();
+    if (!conversation) {
+      return sendError(res, "Conversation not found", 404, "NOT_FOUND", `No conversation with id ${req.params.id}`);
+    }
+    if (conversation.userId.toString() !== req.user!._id.toString()) {
+      return sendError(res, "Not authorized to view this conversation", 403, "FORBIDDEN", "Only the owner can view");
+    }
+    sendSuccess(res, { conversation });
+  } catch (error) {
+    sendError(res, "Failed to fetch conversation", 500, "SERVER_ERROR", (error as Error).message);
+  }
+});
+
+// DELETE /api/v1/ai/conversations/:id — owner only
+router.delete("/conversations/:id", authenticate, async (req: Request, res: Response) => {
+  try {
+    const conversation = await AIConversation.findById(req.params.id);
+    if (!conversation) {
+      return sendError(res, "Conversation not found", 404, "NOT_FOUND", `No conversation with id ${req.params.id}`);
+    }
+    if (conversation.userId.toString() !== req.user!._id.toString()) {
+      return sendError(res, "Not authorized to delete this conversation", 403, "FORBIDDEN", "Only the owner can delete");
+    }
+    await AIConversation.findByIdAndDelete(req.params.id);
+    sendSuccess(res, null, "Conversation deleted");
+  } catch (error) {
+    sendError(res, "Failed to delete conversation", 500, "SERVER_ERROR", (error as Error).message);
+  }
+});
+
 export default router;
