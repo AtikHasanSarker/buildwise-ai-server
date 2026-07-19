@@ -2,7 +2,8 @@ import mongoose from "mongoose";
 
 const connectDB = async (): Promise<void> => {
   const conn = await mongoose.connect(process.env.MONGODB_URI as string);
-  console.log(`MongoDB connected: ${conn.connection.host}`);
+  const dbName = conn.connection.db?.databaseName || "unknown";
+  console.log(`MongoDB connected: host=${conn.connection.host}, database="${dbName}"`);
 };
 
 export default connectDB;

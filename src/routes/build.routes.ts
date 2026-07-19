@@ -3,23 +3,15 @@ import Build from "../models/Build";
 import Product from "../models/Product";
 import { sendSuccess, sendError } from "../utils/response";
 import { authenticate } from "../middleware/auth.middleware";
+import { validate } from "../middleware/validate";
+import { createBuildSchema, updateBuildSchema } from "../validation/schemas";
 
 const router = Router();
 
 // POST /api/v1/builds
-router.post("/", authenticate, async (req: Request, res: Response) => {
+router.post("/", authenticate, validate(createBuildSchema), async (req: Request, res: Response) => {
   try {
     const { name, components, totalPrice, aiRecommendation } = req.body;
-
-    if (!name?.trim()) {
-      return sendError(res, "Build name is required", 400, "VALIDATION_ERROR", "name: required");
-    }
-    if (!components || !Array.isArray(components) || components.length === 0) {
-      return sendError(res, "At least one component is required", 400, "VALIDATION_ERROR", "components: required, must be non-empty array");
-    }
-    if (totalPrice == null || totalPrice < 0) {
-      return sendError(res, "Valid total price is required", 400, "VALIDATION_ERROR", "totalPrice: must be >= 0");
-    }
 
     // Validate every productId exists
     const productIds = components.map((c: { productId: string }) => c.productId);
@@ -100,7 +92,7 @@ router.get("/:id", authenticate, async (req: Request, res: Response) => {
 });
 
 // PUT /api/v1/builds/:id — owner only
-router.put("/:id", authenticate, async (req: Request, res: Response) => {
+router.put("/:id", authenticate, validate(updateBuildSchema), async (req: Request, res: Response) => {
   try {
     const build = await Build.findById(req.params.id);
     if (!build) {

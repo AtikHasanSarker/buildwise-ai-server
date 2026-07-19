@@ -3,6 +3,8 @@ import Review from "../models/Review";
 import Product from "../models/Product";
 import { sendSuccess, sendError } from "../utils/response";
 import { authenticate } from "../middleware/auth.middleware";
+import { validate } from "../middleware/validate";
+import { createReviewSchema } from "../validation/schemas";
 
 const router = Router();
 
@@ -39,18 +41,11 @@ router.get("/products/:productId/reviews", async (req: Request, res: Response) =
 });
 
 // POST /api/v1/products/:productId/reviews — protected
-router.post("/products/:productId/reviews", authenticate, async (req: Request, res: Response) => {
+router.post("/products/:productId/reviews", authenticate, validate(createReviewSchema), async (req: Request, res: Response) => {
   try {
     const { productId } = req.params;
     const { rating, comment } = req.body;
     const userId = req.user!._id;
-
-    if (!rating || rating < 1 || rating > 5) {
-      return sendError(res, "Rating must be between 1 and 5", 400, "VALIDATION_ERROR", "rating: must be 1-5");
-    }
-    if (!comment?.trim()) {
-      return sendError(res, "Comment is required", 400, "VALIDATION_ERROR", "comment: required");
-    }
 
     const product = await Product.findById(productId);
     if (!product) {

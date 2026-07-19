@@ -3,23 +3,24 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import User from "../models/User";
 import { sendSuccess, sendError } from "../utils/response";
-import {
-  authenticate,
-  generateToken,
-  generateRefreshToken,
-} from "../middleware/auth.middleware";
+import { authenticate } from "../middleware/auth.middleware";
+import { validate } from "../middleware/validate";
+import { registerSchema, loginSchema, googleAuthSchema } from "../validation/schemas";
 
 const router = Router();
 
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MIN_PASSWORD_LENGTH = 8;
-
-const setTokenCookie = (res: Response, token: string, maxAge: number) => {
-  res.cookie("token", token, {
+const setCookie = (
+  res: Response,
+  name: string,
+  value: string,
+  maxAge: number
+) => {
+  res.cookie(name, value, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     maxAge,
+    path: "/",
   });
 };
 
@@ -32,31 +33,15 @@ const sanitizeUser = (user: { _id: unknown; name: string; email: string; role: s
 });
 
 // POST /api/v1/auth/register
-router.post("/register", async (req: Request, res: Response) => {
+router.post("/register", validate(registerSchema), async (req: Request, res: Response) => {
   try {
     const { name, email, password } = req.body;
 
-    if (!name?.trim()) {
-      return sendError(res, "Name is required", 400, "VALIDATION_ERROR", "name: required");
-    }
-    if (!email?.trim()) {
-      return sendError(res, "Email is required", 400, "VALIDATION_ERROR", "email: required");
-    }
-    if (!EMAIL_REGEX.test(email)) {
-      return sendError(res, "Invalid email format", 400, "VALIDATION_ERROR", "email: invalid format");
-    }
-    if (!password || password.length < MIN_PASSWORD_LENGTH) {
-      return sendError(
-        res,
-        `Password must be at least ${MIN_PASSWORD_LENGTH} characters`,
-        400,
-        "VALIDATION_ERROR",
-        `password: min ${MIN_PASSWORD_LENGTH} characters`
-      );
-    }
+    console.log(`[REGISTER] Attempting to register: ${email}`);
 
     const existingUser = await User.findOne({ email: email.toLowerCase() });
     if (existingUser) {
+      console.log(`[REGISTER] Email already registered: ${email}`);
       return sendError(res, "Email already registered", 409, "VALIDATION_ERROR", "email: already exists");
     }
 
@@ -67,29 +52,26 @@ router.post("/register", async (req: Request, res: Response) => {
       password: hashedPassword,
     });
 
+    console.log(`[REGISTER] User created — _id: ${user._id}, email: ${user.email}, role: ${user.role}`);
+
     const token = generateToken(user._id.toString(), user.role);
     const refreshToken = generateRefreshToken(user._id.toString(), user.role);
 
-    setTokenCookie(res, token, 7 * 24 * 60 * 60 * 1000);
-    setTokenCookie(res, refreshToken, 30 * 24 * 60 * 60 * 1000);
+setCookie(res, "token", token, 7 * 24 * 60 * 60 * 1000);
+
+setCookie(res, "refreshToken", refreshToken, 30 * 24 * 60 * 60 * 1000);
 
     sendSuccess(res, { user: sanitizeUser(user), token }, "Registration successful", 201);
   } catch (error) {
+    console.error(`[REGISTER] Error:`, error);
     sendError(res, "Registration failed", 500, "SERVER_ERROR", (error as Error).message);
   }
 });
 
 // POST /api/v1/auth/login
-router.post("/login", async (req: Request, res: Response) => {
+router.post("/login", validate(loginSchema), async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
-
-    if (!email?.trim()) {
-      return sendError(res, "Email is required", 400, "VALIDATION_ERROR", "email: required");
-    }
-    if (!password) {
-      return sendError(res, "Password is required", 400, "VALIDATION_ERROR", "password: required");
-    }
 
     const user = await User.findOne({ email: email.toLowerCase() }).select("+password");
     if (!user || !user.password) {
@@ -104,8 +86,9 @@ router.post("/login", async (req: Request, res: Response) => {
     const token = generateToken(user._id.toString(), user.role);
     const refreshToken = generateRefreshToken(user._id.toString(), user.role);
 
-    setTokenCookie(res, token, 7 * 24 * 60 * 60 * 1000);
-    setTokenCookie(res, refreshToken, 30 * 24 * 60 * 60 * 1000);
+   setCookie(res, "token", token, 7 * 24 * 60 * 60 * 1000);
+
+   setCookie(res, "refreshToken", refreshToken, 30 * 24 * 60 * 60 * 1000);
 
     sendSuccess(res, { user: sanitizeUser(user), token }, "Login successful");
   } catch (error) {
@@ -114,13 +97,9 @@ router.post("/login", async (req: Request, res: Response) => {
 });
 
 // POST /api/v1/auth/google
-router.post("/google", async (req: Request, res: Response) => {
+router.post("/google", validate(googleAuthSchema), async (req: Request, res: Response) => {
   try {
     const { idToken } = req.body;
-
-    if (!idToken) {
-      return sendError(res, "Google token is required", 400, "VALIDATION_ERROR", "idToken: required");
-    }
 
     // Verify Google token (production: use google-auth-library)
     // For development, decode the JWT payload without verification
@@ -163,8 +142,9 @@ router.post("/google", async (req: Request, res: Response) => {
     const token = generateToken(user._id.toString(), user.role);
     const refreshToken = generateRefreshToken(user._id.toString(), user.role);
 
-    setTokenCookie(res, token, 7 * 24 * 60 * 60 * 1000);
-    setTokenCookie(res, refreshToken, 30 * 24 * 60 * 60 * 1000);
+   setCookie(res, "token", token, 7 * 24 * 60 * 60 * 1000);
+
+   setCookie(res, "refreshToken", refreshToken, 30 * 24 * 60 * 60 * 1000);
 
     sendSuccess(res, { user: sanitizeUser(user), token }, "Google login successful");
   } catch (error) {
@@ -173,19 +153,23 @@ router.post("/google", async (req: Request, res: Response) => {
 });
 
 // POST /api/v1/auth/logout
-router.post("/logout", authenticate, (_req: Request, res: Response) => {
-  res.clearCookie("token");
-  res.clearCookie("refreshToken");
+router.post("/logout", (_req: Request, res: Response) => {
+  res.clearCookie("token", { path: "/" });
+  res.clearCookie("refreshToken", { path: "/" });
+
   sendSuccess(res, null, "Logged out successfully");
 });
 
 // GET /api/v1/auth/me
 router.get("/me", authenticate, async (req: Request, res: Response) => {
   try {
+    console.log(`[AUTH/ME] Fetching user from DB — userId: ${req.user!._id}`);
     const user = await User.findById(req.user!._id).select("name email role avatar createdAt");
     if (!user) {
+      console.log(`[AUTH/ME] User NOT found in DB — userId: ${req.user!._id}`);
       return sendError(res, "User not found", 404, "NOT_FOUND", "User not found");
     }
+    console.log(`[AUTH/ME] User found — _id: ${user._id}, email: ${user.email}`);
     sendSuccess(res, { user: sanitizeUser(user) }, "User fetched");
   } catch (error) {
     sendError(res, "Failed to fetch user", 500, "SERVER_ERROR", (error as Error).message);
@@ -209,12 +193,21 @@ router.post("/refresh", async (req: Request, res: Response) => {
     }
 
     const newToken = generateToken(user._id.toString(), user.role);
-    setTokenCookie(res, newToken, 7 * 24 * 60 * 60 * 1000);
+  setCookie(res, "token", newToken, 7 * 24 * 60 * 60 * 1000);
 
     sendSuccess(res, { token: newToken }, "Token refreshed");
   } catch {
     sendError(res, "Invalid refresh token", 401, "UNAUTHORIZED", "Token expired or invalid");
   }
 });
+
+// Token generators (moved here to avoid import circular dependency)
+function generateToken(userId: string, role: string): string {
+  return jwt.sign({ userId, role }, process.env.JWT_SECRET || "dev-secret-change-me", { expiresIn: "7d" });
+}
+
+function generateRefreshToken(userId: string, role: string): string {
+  return jwt.sign({ userId, role }, process.env.JWT_SECRET || "dev-secret-change-me", { expiresIn: "30d" });
+}
 
 export default router;

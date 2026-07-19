@@ -5,6 +5,8 @@ import AIConversation from "../models/AIConversation";
 import RateLimit from "../models/RateLimit";
 import { sendSuccess, sendError } from "../utils/response";
 import { authenticate } from "../middleware/auth.middleware";
+import { validate } from "../middleware/validate";
+import { generateBuildSchema, checkCompatibilitySchema, chatSchema } from "../validation/schemas";
 
 const router = Router();
 
@@ -124,23 +126,10 @@ const parseGeminiResponse = (text: string): { components: { category: string; pr
 };
 
 // POST /api/v1/ai/generate-build
-router.post("/generate-build", async (req: Request, res: Response) => {
+router.post("/generate-build", validate(generateBuildSchema), async (req: Request, res: Response) => {
   try {
-    // Step 1: Validate input
+    // Step 1: Input already validated by zod
     const { budget, purpose, preferredBrand } = req.body;
-
-    if (!budget || typeof budget !== "number" || budget <= 0) {
-      return sendError(res, "Budget must be a positive number", 400, "VALIDATION_ERROR", "budget: must be > 0");
-    }
-    if (!purpose || !VALID_PURPOSES.includes(purpose as Purpose)) {
-      return sendError(
-        res,
-        `Purpose must be one of: ${VALID_PURPOSES.join(", ")}`,
-        400,
-        "VALIDATION_ERROR",
-        `purpose: must be ${VALID_PURPOSES.join(" | ")}`
-      );
-    }
 
     // Step 2: Rate limiting
     const isAuth = !!req.user;
@@ -180,8 +169,8 @@ router.post("/generate-build", async (req: Request, res: Response) => {
         stock: { $gt: 0 },
         price: { $gte: minPrice, $lte: maxPrice },
       };
-      if (preferredBrand) {
-        query.brand = preferredBrand;
+      if (preferredBrand && preferredBrand.length > 0) {
+        query.brand = { $in: preferredBrand };
       }
 
       const products = await Product.find(query)
@@ -566,20 +555,9 @@ const findAlternatives = async (
 };
 
 // POST /api/v1/ai/check-compatibility
-router.post("/check-compatibility", async (req: Request, res: Response) => {
+router.post("/check-compatibility", validate(checkCompatibilitySchema), async (req: Request, res: Response) => {
   try {
-    const { components } = req.body as { components?: ComponentInput[] };
-
-    // Step 1: Validate input
-    if (!components || !Array.isArray(components) || components.length < 2) {
-      return sendError(
-        res,
-        "At least 2 components are required",
-        400,
-        "VALIDATION_ERROR",
-        "components: must be an array with at least 2 items"
-      );
-    }
+    const { components } = req.body as { components: ComponentInput[] };
 
     const productIds = components.map((c) => c.productId);
     const existingProducts = await Product.find({ _id: { $in: productIds } }).lean();
@@ -900,14 +878,9 @@ const generateSuggestedPrompts = async (
 };
 
 // POST /api/v1/ai/chat — SSE streaming
-router.post("/chat", async (req: Request, res: Response) => {
+router.post("/chat", validate(chatSchema), async (req: Request, res: Response) => {
   try {
     const { message, conversationId } = req.body;
-
-    // Step 1: Validate
-    if (!message?.trim()) {
-      return sendError(res, "Message is required", 400, "VALIDATION_ERROR", "message: required and non-empty");
-    }
 
     // Rate limiting (shared with generate-build)
     const isAuth = !!req.user;

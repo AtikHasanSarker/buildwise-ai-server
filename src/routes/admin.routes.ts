@@ -7,6 +7,8 @@ import AIConversation from "../models/AIConversation";
 import { sendSuccess, sendError } from "../utils/response";
 import { authenticate } from "../middleware/auth.middleware";
 import { requireAdmin } from "../middleware/admin.middleware";
+import { validate } from "../middleware/validate";
+import { updateRoleSchema } from "../validation/schemas";
 
 const router = Router();
 
@@ -105,8 +107,9 @@ router.get("/users", async (req: Request, res: Response) => {
     const skip = (pageNum - 1) * limitNum;
 
     const filter: Record<string, unknown> = {};
-    if (search) {
-      const regex = { $regex: search as string, $options: "i" };
+    if (search && typeof search === "string") {
+      const safeSearch = search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const regex = { $regex: safeSearch, $options: "i" };
       filter.$or = [{ name: regex }, { email: regex }];
     }
 
@@ -127,13 +130,9 @@ router.get("/users", async (req: Request, res: Response) => {
 });
 
 // PUT /api/v1/admin/users/:id/role
-router.put("/users/:id/role", async (req: Request, res: Response) => {
+router.put("/users/:id/role", validate(updateRoleSchema), async (req: Request, res: Response) => {
   try {
     const { role } = req.body;
-
-    if (!role || !["user", "admin"].includes(role)) {
-      return sendError(res, "Role must be 'user' or 'admin'", 400, "VALIDATION_ERROR", "role: must be user | admin");
-    }
 
     // Prevent admin from demoting themselves
     if (req.user!._id.toString() === req.params.id) {

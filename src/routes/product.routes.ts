@@ -4,11 +4,18 @@ import Category from "../models/Category";
 import { sendSuccess, sendError } from "../utils/response";
 import { authenticate } from "../middleware/auth.middleware";
 import { requireAdmin } from "../middleware/admin.middleware";
+import { validate, validateQuery } from "../middleware/validate";
+import { createProductSchema, updateProductSchema, productsQuerySchema } from "../validation/schemas";
 
 const router = Router();
 
+// Escape special regex characters in search input
+const escapeRegex = (str: string): string => {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+};
+
 // GET /api/v1/products
-router.get("/", async (req: Request, res: Response) => {
+router.get("/", validateQuery(productsQuerySchema), async (req: Request, res: Response) => {
   try {
     const {
       page = "1",
@@ -19,10 +26,10 @@ router.get("/", async (req: Request, res: Response) => {
       maxPrice,
       search,
       sort,
-    } = req.query;
+    } = req.query as Record<string, string>;
 
-    const pageNum = Math.max(1, parseInt(page as string, 10) || 1);
-    const limitNum = Math.min(50, Math.max(1, parseInt(limit as string, 10) || 12));
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(50, Math.max(1, parseInt(limit, 10) || 12));
     const skip = (pageNum - 1) * limitNum;
 
     const filter: Record<string, unknown> = {};
@@ -35,10 +42,11 @@ router.get("/", async (req: Request, res: Response) => {
       if (maxPrice) (filter.price as Record<string, number>).$lte = Number(maxPrice);
     }
     if (search) {
+      const safeSearch = escapeRegex(search);
       filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { brand: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } },
+        { name: { $regex: safeSearch, $options: "i" } },
+        { brand: { $regex: safeSearch, $options: "i" } },
+        { description: { $regex: safeSearch, $options: "i" } },
       ];
     }
 
@@ -88,33 +96,9 @@ router.get("/:id", async (req: Request, res: Response) => {
 });
 
 // POST /api/v1/products — admin only
-router.post("/", authenticate, requireAdmin, async (req: Request, res: Response) => {
+router.post("/", authenticate, requireAdmin, validate(createProductSchema), async (req: Request, res: Response) => {
   try {
-    const { name, brand, category, price, description, images, specifications, stock } = req.body;
-
-    if (!name?.trim()) return sendError(res, "Name is required", 400, "VALIDATION_ERROR", "name: required");
-    if (!brand?.trim()) return sendError(res, "Brand is required", 400, "VALIDATION_ERROR", "brand: required");
-    if (!category) return sendError(res, "Category is required", 400, "VALIDATION_ERROR", "category: required");
-    if (price == null || price < 0) return sendError(res, "Valid price is required", 400, "VALIDATION_ERROR", "price: must be >= 0");
-    if (!description?.trim()) return sendError(res, "Description is required", 400, "VALIDATION_ERROR", "description: required");
-    if (stock == null || stock < 0) return sendError(res, "Valid stock is required", 400, "VALIDATION_ERROR", "stock: must be >= 0");
-
-    const validCategories = ["CPU", "GPU", "Motherboard", "RAM", "SSD", "HDD", "PSU", "Case", "Cooler"];
-    if (!validCategories.includes(category)) {
-      return sendError(res, "Invalid category", 400, "VALIDATION_ERROR", `category: must be one of ${validCategories.join(", ")}`);
-    }
-
-    const product = await Product.create({
-      name: name.trim(),
-      brand: brand.trim(),
-      category,
-      price,
-      description: description.trim(),
-      images: images || [],
-      specifications: specifications || {},
-      stock,
-    });
-
+    const product = await Product.create(req.body);
     sendSuccess(res, { product }, "Product created", 201);
   } catch (error) {
     sendError(res, "Failed to create product", 500, "SERVER_ERROR", (error as Error).message);
@@ -122,7 +106,7 @@ router.post("/", authenticate, requireAdmin, async (req: Request, res: Response)
 });
 
 // PUT /api/v1/products/:id — admin only
-router.put("/:id", authenticate, requireAdmin, async (req: Request, res: Response) => {
+router.put("/:id", authenticate, requireAdmin, validate(updateProductSchema), async (req: Request, res: Response) => {
   try {
     const product = await Product.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
