@@ -1,10 +1,10 @@
 import { Router, Request, Response } from "express";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
 import Product, { ProductCategory, IProduct } from "../models/Product";
 import AIConversation from "../models/AIConversation";
 import RateLimit from "../models/RateLimit";
 import { sendSuccess, sendError } from "../utils/response";
-import { authenticate } from "../middleware/auth.middleware";
+import { authenticate, optionalAuth } from "../middleware/auth.middleware";
 import { validate } from "../middleware/validate";
 import { generateBuildSchema, checkCompatibilitySchema, chatSchema } from "../validation/schemas";
 
@@ -67,6 +67,8 @@ const BUDGET_WEIGHTS: Record<Purpose, Partial<Record<ProductCategory, number>>> 
   },
 };
 
+const GROQ_MODEL = "openai/gpt-oss-120b";
+
 const getTodayKey = (): string => {
   return new Date().toISOString().split("T")[0];
 };
@@ -87,6 +89,14 @@ const checkRateLimit = async (identifier: string, limit: number): Promise<{ allo
   record.count += 1;
   await record.save();
   return { allowed: true, count: record.count };
+};
+
+const getGroqClient = (): Groq => {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) {
+    throw new Error("GROQ_API_KEY not set");
+  }
+  return new Groq({ apiKey });
 };
 
 const buildPrompt = (candidates: Record<string, unknown[]>, purpose: string): string => {
@@ -110,7 +120,7 @@ CANDIDATES:
 ${JSON.stringify(candidates, null, 2)}`;
 };
 
-const parseGeminiResponse = (text: string): { components: { category: string; productId: string; reasoning: string }[]; overallReasoning: string } | null => {
+const parseAIResponse = (text: string): { components: { category: string; productId: string; reasoning: string }[]; overallReasoning: string } | null => {
   let cleaned = text.trim();
   // Strip markdown code fences if present
   cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
@@ -126,7 +136,7 @@ const parseGeminiResponse = (text: string): { components: { category: string; pr
 };
 
 // POST /api/v1/ai/generate-build
-router.post("/generate-build", validate(generateBuildSchema), async (req: Request, res: Response) => {
+router.post("/generate-build", optionalAuth, validate(generateBuildSchema), async (req: Request, res: Response) => {
   try {
     // Step 1: Input already validated by zod
     const { budget, purpose, preferredBrand } = req.body;
@@ -135,6 +145,7 @@ router.post("/generate-build", validate(generateBuildSchema), async (req: Reques
     const isAuth = !!req.user;
     const identifier = isAuth ? `user:${req.user!._id}` : `ip:${req.ip}`;
     const dailyLimit = isAuth ? 50 : 5;
+    console.log(`[AI/rate] generate-build: isAuth=${isAuth}, identifier=${identifier}, limit=${dailyLimit}`);
 
     const rateCheck = await checkRateLimit(identifier, dailyLimit);
     if (!rateCheck.allowed) {
@@ -201,32 +212,50 @@ router.post("/generate-build", validate(generateBuildSchema), async (req: Reques
       );
     }
 
-    // Step 4: Call Gemini
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return sendError(res, "AI service not configured", 500, "AI_ERROR", "GEMINI_API_KEY not set");
+    // Step 4: Call Groq
+    let groq: Groq;
+    try {
+      groq = getGroqClient();
+    } catch {
+      return sendError(res, "AI service not configured", 500, "AI_ERROR", "GROQ_API_KEY not set");
     }
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
     const prompt = buildPrompt(candidatesByCategory, purpose);
-    let result = await model.generateContent(prompt);
-    let responseText = result.response.text();
+    let completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: "system", content: "You are an expert PC builder assistant. You MUST respond with valid JSON only. No markdown, no code fences, no extra text." },
+        { role: "user", content: prompt },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.3,
+      max_tokens: 4096,
+    });
+
+    let responseText = completion.choices[0]?.message?.content || "";
 
     // Step 5: Parse response
-    let parsed = parseGeminiResponse(responseText);
+    let parsed = parseAIResponse(responseText);
 
     // Retry once with stricter prompt if parse failed
     if (!parsed) {
       const strictPrompt = prompt + "\n\nREMINDER: Output ONLY valid JSON. No markdown, no code fences, no explanations outside the JSON.";
-      result = await model.generateContent(strictPrompt);
-      responseText = result.response.text();
-      parsed = parseGeminiResponse(responseText);
+      completion = await groq.chat.completions.create({
+        model: GROQ_MODEL,
+        messages: [
+          { role: "system", content: "You are an expert PC builder assistant. Respond with valid JSON only." },
+          { role: "user", content: strictPrompt },
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1,
+        max_tokens: 4096,
+      });
+      responseText = completion.choices[0]?.message?.content || "";
+      parsed = parseAIResponse(responseText);
     }
 
     if (!parsed) {
-      return sendError(res, "Failed to parse AI response", 502, "AI_ERROR", "Gemini returned invalid JSON");
+      return sendError(res, "Failed to parse AI response", 502, "AI_ERROR", "AI returned invalid JSON");
     }
 
     // Step 6: Validate every productId exists and is in stock
@@ -312,9 +341,8 @@ router.post("/generate-build", validate(generateBuildSchema), async (req: Reques
       conversationId: conversationId || null,
     });
   } catch (error) {
-    // Gemini API outage or any other error
     const message = error instanceof Error ? error.message : "Unknown error";
-    if (message.includes("API") || message.includes("quota") || message.includes("SAFETY")) {
+    if (message.includes("API") || message.includes("quota") || message.includes("rate") || message.includes("429")) {
       return sendError(res, "AI service temporarily unavailable", 502, "AI_ERROR", message);
     }
     sendError(res, "Failed to generate build", 500, "SERVER_ERROR", message);
@@ -506,24 +534,33 @@ const runRuleBasedChecks = (
 };
 
 const generateExplanation = async (
-  genAI: GoogleGenerativeAI,
+  groq: Groq,
   productA: LeanProduct,
   productB: LeanProduct,
   issueText: string
 ): Promise<string> => {
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    const prompt = `You are a PC hardware expert. Explain this compatibility issue in 1-2 clear sentences.
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: "system", content: "You are a PC hardware expert. Respond with valid JSON only." },
+        {
+          role: "user",
+          content: `Explain this compatibility issue in 1-2 clear sentences.
 Return ONLY valid JSON: { "issue": "your explanation" }
 
 Product A: ${productA.name} (${productA.category})
 Product B: ${productB.name} (${productB.category})
-Problem: ${issueText}`;
-
-    const result = await model.generateContent(prompt);
-    let text = result.response.text().trim();
-    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-    const parsed = JSON.parse(text);
+Problem: ${issueText}`,
+        },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.3,
+      max_tokens: 256,
+    });
+    const text = completion.choices[0]?.message?.content || "";
+    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    const parsed = JSON.parse(cleaned);
     return parsed.issue || issueText;
   } catch {
     return issueText;
@@ -589,8 +626,12 @@ router.post("/check-compatibility", validate(checkCompatibilitySchema), async (r
     }
 
     // Step 4 & 5: For each issue, get AI explanation + find alternatives
-    const apiKey = process.env.GEMINI_API_KEY;
-    const genAI = apiKey ? new GoogleGenerativeAI(apiKey) : null;
+    let groq: Groq | null = null;
+    try {
+      groq = getGroqClient();
+    } catch {
+      groq = null;
+    }
 
     const issues: CompatibilityIssue[] = [];
 
@@ -602,8 +643,8 @@ router.post("/check-compatibility", validate(checkCompatibilitySchema), async (r
 
       // AI explanation (graceful fallback)
       let explanation = raw.issue;
-      if (genAI) {
-        explanation = await generateExplanation(genAI, prodA, prodB, raw.issue);
+      if (groq) {
+        explanation = await generateExplanation(groq, prodA, prodB, raw.issue);
       }
 
       // Find alternatives for the incompatible product (first in the pair)
@@ -826,22 +867,21 @@ const searchRelevantProducts = async (message: string): Promise<unknown[]> => {
   }));
 };
 
-const buildChatPrompt = (
+const buildChatMessages = (
   userMessage: string,
   history: { role: string; content: string }[],
   productContext: unknown[]
-): { role: string; parts: string }[] => {
-  const messages: { role: string; parts: string }[] = [];
+): { role: "system" | "user" | "assistant"; content: string }[] => {
+  const messages: { role: "system" | "user" | "assistant"; content: string }[] = [];
 
   // System instruction
-  messages.push({ role: "user", parts: CHAT_SYSTEM_PROMPT });
-  messages.push({ role: "model", parts: "Understood. I'm BuildWise AI's shopping assistant. How can I help you with your PC build?" });
+  messages.push({ role: "system", content: CHAT_SYSTEM_PROMPT });
 
   // Conversation history
   for (const msg of history) {
     messages.push({
-      role: msg.role === "user" ? "user" : "model",
-      parts: msg.content,
+      role: msg.role === "user" ? "user" : "assistant",
+      content: msg.content,
     });
   }
 
@@ -851,25 +891,36 @@ const buildChatPrompt = (
     contextBlock = `\n\n[Product Context — reference these real products in your reply]\n${JSON.stringify(productContext, null, 2)}`;
   }
 
-  messages.push({ role: "user", parts: userMessage + contextBlock });
+  messages.push({ role: "user", content: userMessage + contextBlock });
 
   return messages;
 };
 
 const generateSuggestedPrompts = async (
-  genAI: GoogleGenerativeAI,
+  groq: Groq,
   conversationTopic: string
 ): Promise<string[]> => {
   try {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    const result = await model.generateContent(
-      `Based on this PC building conversation topic: "${conversationTopic}", generate exactly 3 short follow-up questions a user might ask. Return ONLY a valid JSON array of strings, no markdown.\nExample: ["question 1", "question 2", "question 3"]`
-    );
-    let text = result.response.text().trim();
-    text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
-    const parsed = JSON.parse(text);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed.slice(0, 3);
+    const completion = await groq.chat.completions.create({
+      model: GROQ_MODEL,
+      messages: [
+        { role: "system", content: "You generate follow-up questions. Respond with valid JSON array only." },
+        {
+          role: "user",
+          content: `Based on this PC building conversation topic: "${conversationTopic}", generate exactly 3 short follow-up questions a user might ask. Return ONLY a valid JSON array of strings, no markdown.\nExample: ["question 1", "question 2", "question 3"]`,
+        },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.7,
+      max_tokens: 256,
+    });
+    const text = completion.choices[0]?.message?.content || "[]";
+    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+    const parsed = JSON.parse(cleaned);
+    // Handle both array and object wrapping
+    const arr = Array.isArray(parsed) ? parsed : parsed.questions || parsed.prompts || [];
+    if (Array.isArray(arr) && arr.length > 0) {
+      return arr.slice(0, 3);
     }
     return [];
   } catch {
@@ -878,7 +929,7 @@ const generateSuggestedPrompts = async (
 };
 
 // POST /api/v1/ai/chat — SSE streaming
-router.post("/chat", validate(chatSchema), async (req: Request, res: Response) => {
+router.post("/chat", optionalAuth, validate(chatSchema), async (req: Request, res: Response) => {
   try {
     const { message, conversationId } = req.body;
 
@@ -886,7 +937,9 @@ router.post("/chat", validate(chatSchema), async (req: Request, res: Response) =
     const isAuth = !!req.user;
     const identifier = isAuth ? `user:${req.user!._id}` : `ip:${req.ip}`;
     const dailyLimit = isAuth ? 50 : 5;
+    console.log(`[AI/rate] chat: isAuth=${isAuth}, identifier=${identifier}, limit=${dailyLimit}`);
     const rateCheck = await checkRateLimit(identifier, dailyLimit);
+    console.log(`[AI/rate] chat: count=${rateCheck.count}, allowed=${rateCheck.allowed}`);
     if (!rateCheck.allowed) {
       return sendError(res, `Daily AI request limit reached (${dailyLimit}/day)`, 429, "RATE_LIMITED", `Used ${rateCheck.count}/${dailyLimit}`);
     }
@@ -922,38 +975,51 @@ router.post("/chat", validate(chatSchema), async (req: Request, res: Response) =
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      res.write(`data: ${JSON.stringify({ type: "error", message: "AI service not configured" })}\n\n`);
+    let groq: Groq;
+    try {
+      groq = getGroqClient();
+    } catch {
+      res.write(`data: ${JSON.stringify({ type: "error", message: "AI service not configured — GROQ_API_KEY is missing" })}\n\n`);
       res.write("data: [DONE]\n\n");
       return res.end();
     }
 
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-    const chatMessages = buildChatPrompt(message.trim(), history, productContext);
+    const chatMessages = buildChatMessages(message.trim(), history, productContext);
 
-    // Step 5: Stream from Gemini
+    // Step 5: Stream from Groq
     let fullReply = "";
     try {
-      const result = await model.generateContent({
-        contents: chatMessages.map((m) => ({
-          role: m.role === "model" ? "model" : "user",
-          parts: [{ text: m.parts }],
-        })),
+      console.log(`[AI] Calling Groq with ${chatMessages.length} messages...`);
+      const stream = await groq.chat.completions.create({
+        model: GROQ_MODEL,
+        messages: chatMessages,
+        stream: true,
+        temperature: 0.7,
+        max_tokens: 2048,
       });
 
-      const text = result.response.text();
-      // Simulate streaming by sending chunks
-      const chunkSize = 20;
-      for (let i = 0; i < text.length; i += chunkSize) {
-        const chunk = text.substring(i, i + chunkSize);
-        fullReply += chunk;
-        res.write(`data: ${JSON.stringify({ type: "token", content: chunk })}\n\n`);
+      for await (const chunk of stream) {
+        const token = chunk.choices[0]?.delta?.content || "";
+        if (token) {
+          fullReply += token;
+          const sseData = JSON.stringify({ type: "token", content: token });
+          res.write(`data: ${sseData}\n\n`);
+        }
       }
-    } catch (geminiError) {
-      const errMsg = geminiError instanceof Error ? geminiError.message : "AI service error";
-      res.write(`data: ${JSON.stringify({ type: "error", message: errMsg })}\n\n`);
+      console.log(`[AI/SSE] Groq stream complete, total length: ${fullReply.length}`);
+    } catch (groqError) {
+      const rawMsg = groqError instanceof Error ? groqError.message : "AI service error";
+      console.error(`[AI] Groq API error:`, rawMsg);
+
+      const isQuotaError = /429|quota|rate.?limit|tokens?_per|requests?_per/i.test(rawMsg);
+      const isAuthError = /401|invalid|unauthorized|api.?key/i.test(rawMsg);
+      const userMessage = isQuotaError
+        ? "Our AI assistant is temporarily at capacity. Please try again in a few minutes."
+        : isAuthError
+        ? "AI service authentication failed. Please check the configuration."
+        : "Something went wrong with the AI service. Please try again.";
+
+      res.write(`data: ${JSON.stringify({ type: "error", message: userMessage })}\n\n`);
       res.write("data: [DONE]\n\n");
       return res.end();
     }
@@ -971,15 +1037,17 @@ router.post("/chat", validate(chatSchema), async (req: Request, res: Response) =
     let suggestedPrompts: string[] = [];
     if (productContext.length > 0) {
       const topicSummary = extractCategoryHints(message).join(", ") || message.substring(0, 50);
-      suggestedPrompts = await generateSuggestedPrompts(genAI, topicSummary);
+      suggestedPrompts = await generateSuggestedPrompts(groq, topicSummary);
     }
 
     // Send metadata as final event
-    res.write(`data: ${JSON.stringify({
+    const doneData = JSON.stringify({
       type: "done",
       conversationId: savedConversationId,
       suggestedPrompts,
-    })}\n\n`);
+    });
+    console.log(`[AI/SSE] Sending done: ${doneData}`);
+    res.write(`data: ${doneData}\n\n`);
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (error) {

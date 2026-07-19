@@ -70,3 +70,42 @@ export const authenticate = async (
     });
   }
 };
+
+/**
+ * Optional authentication — sets req.user if a valid token is present,
+ * but does NOT reject requests without a token (guests allowed).
+ */
+export const optionalAuth = async (
+  req: Request,
+  _res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const token =
+      req.cookies?.token ||
+      req.headers.authorization?.replace("Bearer ", "");
+
+    if (!token) {
+      return next();
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    const user = await User.findById(decoded.userId).select(
+      "name email role avatar"
+    );
+
+    if (user) {
+      req.user = {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        avatar: user.avatar,
+      };
+    }
+  } catch {
+    // Invalid token — treat as guest, don't reject
+  }
+
+  next();
+};
