@@ -8,8 +8,16 @@ import User from "../models/User";
 import Category from "../models/Category";
 import Product from "../models/Product";
 
-const MONGODB_URI =
-  process.env.MONGODB_URI || "mongodb://localhost:27017/buildwise-ai";
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error("MONGODB_URI environment variable is required");
+  process.exit(1);
+}
+
+if (process.env.NODE_ENV === "production") {
+  console.error("Refusing to run seed script in production environment");
+  process.exit(1);
+}
 
 const categories = [
   { name: "CPU", slug: "cpu", icon: "cpu" },
@@ -32,7 +40,7 @@ const products = JSON.parse(fs.readFileSync(seedJsonPath, "utf-8"));
 
 async function seed() {
   try {
-    await mongoose.connect(MONGODB_URI);
+    await mongoose.connect(MONGODB_URI!);
     const dbName = mongoose.connection.db?.databaseName || "unknown";
     console.log(`Connected to MongoDB — database: "${dbName}"`);
 

@@ -8,7 +8,7 @@ Backend API server for BuildWise AI — a premium PC builder with AI-powered rec
 - **Framework:** Express.js
 - **Database:** MongoDB (Mongoose ODM)
 - **Auth:** JWT + Better Auth
-- **AI:** Google Gemini API
+- **AI:** Groq API
 
 ## Setup
 

@@ -33,9 +33,10 @@ if (process.env.NODE_ENV !== "production") {
 }
 
 // CORS — only allow the actual frontend origin
-const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000")
-  .split(",")
-  .map((o) => o.trim());
+if (!process.env.CLIENT_URL) {
+  throw new Error("CLIENT_URL environment variable is required");
+}
+const allowedOrigins = process.env.CLIENT_URL.split(",").map((o) => o.trim());
 
 app.use(
   cors({
