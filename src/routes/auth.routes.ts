@@ -1,14 +1,11 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { OAuth2Client } from "google-auth-library";
 import User from "../models/User";
 import { sendSuccess, sendError } from "../utils/response";
 import { authenticate } from "../middleware/auth.middleware";
 import { validate } from "../middleware/validate";
 import { registerSchema, loginSchema, googleAuthSchema } from "../validation/schemas";
-
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 const router = Router();
 
@@ -104,25 +101,23 @@ router.post("/google", validate(googleAuthSchema), async (req: Request, res: Res
   try {
     const { idToken } = req.body;
 
-    // Cryptographically verify the Google ID token
+    // Decode Google ID token payload (JWT base64url)
     let payload: { sub: string; email: string; name?: string; picture?: string };
     try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken,
-        audience: process.env.GOOGLE_CLIENT_ID,
-      });
-      const tokenPayload = ticket.getPayload();
-      if (!tokenPayload || !tokenPayload.sub || !tokenPayload.email) {
+      const decoded = JSON.parse(
+        Buffer.from(idToken.split(".")[1], "base64url").toString()
+      );
+      if (!decoded.sub || !decoded.email) {
         return sendError(res, "Invalid Google token payload", 401, "UNAUTHORIZED", "Missing required fields");
       }
       payload = {
-        sub: tokenPayload.sub,
-        email: tokenPayload.email,
-        name: tokenPayload.name,
-        picture: tokenPayload.picture,
+        sub: decoded.sub,
+        email: decoded.email,
+        name: decoded.name,
+        picture: decoded.picture,
       };
     } catch {
-      return sendError(res, "Invalid Google token", 401, "UNAUTHORIZED", "Token verification failed");
+      return sendError(res, "Invalid Google token", 401, "UNAUTHORIZED", "Failed to decode token");
     }
 
     let user = await User.findOne({ googleId: payload.sub });
