@@ -115,7 +115,7 @@ router.get("/users", async (req: Request, res: Response) => {
 
     const [users, total] = await Promise.all([
       User.find(filter)
-        .select("name email role avatar createdAt updatedAt")
+        .select("name email role image createdAt updatedAt")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limitNum)

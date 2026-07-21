@@ -2,22 +2,6 @@ import { z } from "zod";
 
 const VALID_CATEGORIES = ["CPU", "GPU", "Motherboard", "RAM", "SSD", "HDD", "PSU", "Case", "Cooler"] as const;
 
-// Auth
-export const registerSchema = z.object({
-  name: z.string().trim().min(1, "Name is required"),
-  email: z.string().trim().email("Invalid email format"),
-  password: z.string().min(8, "Password must be at least 8 characters"),
-});
-
-export const loginSchema = z.object({
-  email: z.string().trim().email("Invalid email format"),
-  password: z.string().min(1, "Password is required"),
-});
-
-export const googleAuthSchema = z.object({
-  idToken: z.string().min(1, "Google token is required"),
-});
-
 // Products
 export const createProductSchema = z.object({
   name: z.string().trim().min(1, "Name is required"),
